@@ -46,6 +46,18 @@ pub fn mkdir_at(dir_fd: &OwnedFd, name: &str) -> io::Result<()> {
     }
 }
 
+/// Returns true if `name` under `dir_fd` exists and is a regular file (not a symlink or directory).
+pub fn is_regular_file_at(dir_fd: &OwnedFd, name: &str) -> bool {
+    let Ok(n) = cname(name) else {
+        return false;
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        libc::fstatat(dir_fd.as_raw_fd(), n.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+    } == 0;
+    ok && (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+}
+
 /// `link(2)`, following a symlinked source so the sandbox gets the real inode.
 ///
 /// EXDEV and EPERM both come back as `Unsupported`: the source cannot be linked from here and the
@@ -91,22 +103,104 @@ pub fn remove_at(dir_fd: &OwnedFd, name: &str, full: &Path) -> io::Result<()> {
     }
 }
 
+/// Make every directory at or under `p` owner-rwx (`mode | 0o700`), without following symlinks or
+/// touching regular-file inodes (which may be hardlinks to host/CAS blobs).
+fn make_dirs_writable(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return;
+    };
+    if !meta.file_type().is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    if (mode & 0o700) != 0o700 {
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode | 0o700));
+    }
+    if let Ok(entries) = std::fs::read_dir(p) {
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                make_dirs_writable(&entry.path());
+            }
+        }
+    }
+}
+
+fn ensure_parent_dir_writable(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(parent) = p.parent() else {
+        return;
+    };
+    let Ok(meta) = std::fs::symlink_metadata(parent) else {
+        return;
+    };
+    if meta.file_type().is_dir() {
+        let mode = meta.permissions().mode();
+        if (mode & 0o700) != 0o700 {
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode | 0o700));
+        }
+    }
+}
+
 /// Delete a path — file, symlink, or whole subtree. Missing is not an error.
 ///
-/// A slot's directories are left writable by the morph, so the read-only-leaf repair that a
-/// projection with 0555 trees needs does not arise here.
+/// While the morph itself leaves slot directories writable, a sandboxed action or test may `chmod`
+/// scratch subdirectories (e.g. under `_tmp`) to `0500` or `0000`. Fast-path `remove_dir_all` /
+/// `remove_file` first; only on `PermissionDenied` repair directory modes (`u+rwx`, never touching
+/// symlinks or hardlinked regular-file inodes) and retry.
 pub fn remove(p: &Path) -> io::Result<()> {
-    match std::fs::symlink_metadata(p) {
-        Ok(m) if m.file_type().is_dir() => std::fs::remove_dir_all(p),
-        Ok(_) => std::fs::remove_file(p),
+    let is_dir = match std::fs::symlink_metadata(p) {
+        Ok(m) => m.file_type().is_dir(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(io::Error::new(e.kind(), format!("symlink_metadata {}: {e}", p.display()))),
-    }
-    .map_err(|e| io::Error::new(e.kind(), format!("remove {}: {e}", p.display())))
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            ensure_parent_dir_writable(p);
+            match std::fs::symlink_metadata(p) {
+                Ok(m) => m.file_type().is_dir(),
+                Err(e2) if e2.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e2) => {
+                    return Err(io::Error::new(
+                        e2.kind(),
+                        format!("symlink_metadata {}: {e2}", p.display()),
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            return Err(io::Error::new(e.kind(), format!("symlink_metadata {}: {e}", p.display())))
+        }
+    };
+    let res = if is_dir {
+        match std::fs::remove_dir_all(p) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                ensure_parent_dir_writable(p);
+                make_dirs_writable(p);
+                match std::fs::remove_dir_all(p) {
+                    Err(e2) if e2.kind() == io::ErrorKind::NotFound => Ok(()),
+                    r => r,
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }
+    } else {
+        match std::fs::remove_file(p) {
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                ensure_parent_dir_writable(p);
+                match std::fs::remove_file(p) {
+                    Err(e2) if e2.kind() == io::ErrorKind::NotFound => Ok(()),
+                    r => r,
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }
+    };
+    res.map_err(|e| io::Error::new(e.kind(), format!("remove {}: {e}", p.display())))
 }
 
 pub fn mkdir_p(p: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(p).map_err(|e| io::Error::new(e.kind(), format!("mkdir_p {}: {e}", p.display())))
+    std::fs::create_dir_all(p)
+        .map_err(|e| io::Error::new(e.kind(), format!("mkdir_p {}: {e}", p.display())))
 }
 
 /// The mode bits of `p`, following symlinks. `None` when it does not exist.
@@ -126,8 +220,52 @@ pub fn set_mode(p: &Path, mode: u32) -> io::Result<()> {
 /// existence would let one bad materialization pass for content forever after.
 pub fn has_real_content(p: &Path) -> bool {
     match std::fs::symlink_metadata(p) {
-        Ok(m) if m.file_type().is_dir() => std::fs::read_dir(p).map(|mut d| d.next().is_some()).unwrap_or(false),
+        Ok(m) if m.file_type().is_dir() => {
+            std::fs::read_dir(p).map(|mut d| d.next().is_some()).unwrap_or(false)
+        }
         Ok(_) => true,
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_clears_unwritable_subdirs_without_touching_hardlinks_or_symlinks() {
+        let base = std::env::temp_dir().join(format!(
+            "fsops-rm-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = remove(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let host_file = base.join("host_ro_file");
+        std::fs::write(&host_file, b"keep-perms").unwrap();
+        set_mode(&host_file, 0o444).unwrap();
+
+        let ext_dir = base.join("external_ro_dir");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        set_mode(&ext_dir, 0o555).unwrap();
+
+        let scratch = base.join("slot_tmp");
+        let ro_500 = scratch.join("test_rmr_unwritable");
+        let ro_000 = scratch.join("zero_mode_dir");
+        std::fs::create_dir_all(&ro_500).unwrap();
+        std::fs::create_dir_all(&ro_000).unwrap();
+        std::fs::hard_link(&host_file, ro_500.join("linked")).unwrap();
+        std::fs::write(ro_000.join("inner"), b"x").unwrap();
+        std::os::unix::fs::symlink(&ext_dir, ro_500.join("sym_to_ext")).unwrap();
+        set_mode(&ro_500, 0o500).unwrap();
+        set_mode(&ro_000, 0o000).unwrap();
+
+        remove(&scratch).unwrap();
+        assert!(!scratch.exists());
+        assert_eq!(mode_of(&host_file).unwrap() & 0o777, 0o444);
+        assert_eq!(mode_of(&ext_dir).unwrap() & 0o777, 0o555);
+
+        let _ = remove(&base);
     }
 }

@@ -45,38 +45,53 @@ struct Slot {
 pub struct SlotTable {
     slots: Vec<Slot>,
     tick: u64,
+    reuse_count: u64,
 }
 
 impl SlotTable {
     /// Take a slot for a create, and the prior occupant it must reconcile away.
     pub fn claim(&mut self, root_digest: &str, identity: &str) -> (usize, Prior) {
-        let n = self.pick(root_digest, identity);
+        let (n, reused) = self.pick(root_digest, identity);
+        if reused {
+            self.reuse_count += 1;
+        }
         self.slots[n].state = State::Busy;
         (n, std::mem::take(&mut self.slots[n].prior))
     }
 
+    pub fn total_allocated(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn reuse_count(&self) -> u64 {
+        self.reuse_count
+    }
+
     /// Cheapest diff first: the same tree (no placement at all), then the same action (its tree is
     /// one edit away), then the warmest free slot, then a retired number, then growth.
-    fn pick(&mut self, root_digest: &str, identity: &str) -> usize {
+    fn pick(&mut self, root_digest: &str, identity: &str) -> (usize, bool) {
         let free = |s: &Slot| s.state == State::Free;
         if !root_digest.is_empty() {
-            if let Some(n) = self.slots.iter().position(|s| free(s) && s.root_digest == root_digest) {
-                return n;
+            if let Some(n) = self.slots.iter().position(|s| free(s) && s.root_digest == root_digest)
+            {
+                return (n, true);
             }
         }
         if !identity.is_empty() {
             if let Some(n) = self.slots.iter().position(|s| free(s) && s.identity == identity) {
-                return n;
+                return (n, true);
             }
         }
-        if let Some((n, _)) = self.slots.iter().enumerate().filter(|(_, s)| free(s)).max_by_key(|(_, s)| s.lru) {
-            return n;
+        if let Some((n, _)) =
+            self.slots.iter().enumerate().filter(|(_, s)| free(s)).max_by_key(|(_, s)| s.lru)
+        {
+            return (n, true);
         }
         if let Some(n) = self.slots.iter().position(|s| s.state == State::Retired) {
             self.slots[n].prior = Prior::default();
             self.slots[n].root_digest.clear();
             self.slots[n].identity.clear();
-            return n;
+            return (n, false);
         }
         self.slots.push(Slot {
             state: State::Free,
@@ -85,7 +100,7 @@ impl SlotTable {
             prior: Prior::default(),
             lru: 0,
         });
-        self.slots.len() - 1
+        (self.slots.len() - 1, false)
     }
 
     /// Record what the slot now holds. A `None` tree means the morph did not finish and the

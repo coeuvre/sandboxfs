@@ -7,7 +7,7 @@ pub mod proto;
 pub mod tree;
 pub mod wire;
 
-pub use blobstore::BlobStore;
+pub use blobstore::{BlobStore, VerifiedLocation};
 pub use manifest::{Manifest, Outputs};
 pub use proto::ContentSource;
 
@@ -31,13 +31,21 @@ impl From<io::Error> for CreateError {
 
 /// The backend args Bazel relays in the `Negotiate` handshake
 /// (`--sandbox_backend_opt=<name>=<opt>`), parsed once and handed to `Backend::start`.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Options {
     /// `pool_root=<path>`: where to put the pool, for when the default is not on the workspace's
     /// volume. Projection and `collect`'s rename are same-device-only.
     pub pool_root: Option<PathBuf>,
     /// `metrics`: arm kdebug attribution for this workspace.
     pub metrics: bool,
+    /// `linux_sandbox=<path>`: optional path to Bazel's `linux-sandbox` helper binary for hermetic
+    /// mount/network/inaccessible-path confinement inside projected slots on Linux.
+    pub linux_sandbox: Option<PathBuf>,
+    /// `cas_root=<path>`: shared local CAS directory (`<disk_cache>/[<digest_fn>/]cas`) using
+    /// Bazel's `DiskCacheClient` `<cas_root>/<hash[0..2]>/<hash>` layout.
+    pub cas_root: Option<PathBuf>,
+    /// `disk_cache=<path>`: shared local `--disk_cache` root directory.
+    pub disk_cache: Option<PathBuf>,
 }
 
 impl Options {
@@ -45,12 +53,66 @@ impl Options {
         let mut options = Options::default();
         for arg in args {
             match arg.split_once('=').unwrap_or((arg, "")) {
-                ("pool_root", path) if !path.is_empty() => options.pool_root = Some(PathBuf::from(path)),
+                ("pool_root", path) | ("pool-root", path) if !path.is_empty() => options.pool_root = Some(PathBuf::from(path)),
+                ("linux_sandbox", path) | ("linux-sandbox", path) if !path.is_empty() => options.linux_sandbox = Some(PathBuf::from(path)),
+                ("cas_root", path) | ("cas-root", path) if !path.is_empty() => options.cas_root = Some(PathBuf::from(path)),
+                ("disk_cache", path) | ("disk-cache", path) if !path.is_empty() => options.disk_cache = Some(PathBuf::from(path)),
                 ("metrics", "") => options.metrics = true,
-                _ => return Err(format!("unknown sandbox option {arg:?} (expected: pool_root=<path>, metrics)")),
+                _ => return Err(format!("unknown sandbox option {arg:?} (expected: pool_root=<path>, linux_sandbox=<path>, cas_root=<path>, disk_cache=<path>, metrics)")),
             }
         }
         Ok(options)
+    }
+
+    /// Parses CLI `--experimental_sandbox_backend_opt` flags passed to `sandboxfs serve
+    /// --socket=...`.
+    pub fn parse_cli(args: &[String]) -> Options {
+        let mut options = Options::default();
+        let mut i = 0;
+        while i < args.len() {
+            let raw = args[i].trim_start_matches('-');
+            if let Some((k, v)) = raw.split_once('=') {
+                match k {
+                    "pool_root" | "pool-root" if !v.is_empty() => {
+                        options.pool_root = Some(PathBuf::from(v))
+                    }
+                    "linux_sandbox" | "linux-sandbox" if !v.is_empty() => {
+                        options.linux_sandbox = Some(PathBuf::from(v))
+                    }
+                    "cas_root" | "cas-root" if !v.is_empty() => {
+                        options.cas_root = Some(PathBuf::from(v))
+                    }
+                    "disk_cache" | "disk-cache" if !v.is_empty() => {
+                        options.disk_cache = Some(PathBuf::from(v))
+                    }
+                    "metrics" => options.metrics = v.is_empty() || v == "1" || v == "true",
+                    _ => {}
+                }
+            } else {
+                match raw {
+                    "metrics" => options.metrics = true,
+                    "pool_root" | "pool-root" if i + 1 < args.len() => {
+                        options.pool_root = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    "linux_sandbox" | "linux-sandbox" if i + 1 < args.len() => {
+                        options.linux_sandbox = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    "cas_root" | "cas-root" if i + 1 < args.len() => {
+                        options.cas_root = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    "disk_cache" | "disk-cache" if i + 1 < args.len() => {
+                        options.disk_cache = Some(PathBuf::from(&args[i + 1]));
+                        i += 1;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        options
     }
 }
 
@@ -115,7 +177,16 @@ mod options_tests {
     #[test]
     fn bare_names_parse() {
         let o = parse(&["metrics", "pool_root=/tmp/pool"]).unwrap();
-        assert_eq!(o, Options { pool_root: Some(PathBuf::from("/tmp/pool")), metrics: true });
+        assert_eq!(
+            o,
+            Options {
+                pool_root: Some(PathBuf::from("/tmp/pool")),
+                metrics: true,
+                linux_sandbox: None,
+                cas_root: None,
+                disk_cache: None,
+            }
+        );
     }
 
     #[test]

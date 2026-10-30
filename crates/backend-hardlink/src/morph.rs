@@ -10,7 +10,7 @@
 //! the whole reason this backend can be ahead of a projection that rebuilds its forest per action.
 
 use crate::fsops;
-use backend::tree::{Dir, File};
+use backend::tree::{Dir, File, EMPTY_DIRECTORY_DIGEST};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -19,12 +19,27 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
+pub static SKIPPED_SUBTREES: AtomicU64 = AtomicU64::new(0);
+pub static REMOVED_ENTRIES: AtomicU64 = AtomicU64::new(0);
+pub static REPAIRED_FILES: AtomicU64 = AtomicU64::new(0);
+
 /// What every level of the recursion needs and none of it changes.
 pub struct Context<'a> {
     /// The directory containing the workspace exec root; host paths derive from it.
     pub exec_root: &'a str,
     pub links: &'a LinkStore,
     pub missing: &'a Missing,
+    /// Pre-seeded 0-byte file for virtual empty inputs (e.g. `RunfilesTree` `__init__.py`).
+    pub empty_file: Option<&'a Path>,
+    /// True in REAPI v2 mode (`instance_name = "local-file-paths"`), disabling unverified
+    /// `exec_root/<tree_path>` fallback when a non-empty file has no valid `VerifiedLocation`.
+    pub verified_mode: bool,
+    /// Shared local `--disk_cache` CAS root (`<disk_cache>/[<digest_fn>/]cas`) using the
+    /// `<cas_root>/<hash[0..2]>/<hash>` layout.
+    pub cas_root: Option<&'a Path>,
+    /// When true (`--metrics`), verifies existing hardlinks and scans warm directories for
+    /// undeclared scratch files left behind by prior actions.
+    pub heal_untracked: bool,
 }
 
 /// Leaves a morph could not source, collected for a `MissingContent` reply.
@@ -73,7 +88,10 @@ impl LinkStore {
 
     /// Where to link `f` from: the host itself, or a mode-corrected copy. `None` means the host.
     fn source_for(&self, f: &File, host: &Path) -> Option<PathBuf> {
-        if !f.executable || f.digest.is_empty() {
+        // For verified host files (`f.from_verified_host`), the host file already carries its
+        // authoritative executable bit (`0644` vs `0755`), whereas Bazel's `MerkleTreeComputer`
+        // sets `FileNode.is_executable = true` on all files in `v2.Directory`.
+        if f.from_verified_host || !f.executable || f.digest.is_empty() {
             return None;
         }
         if let Some(hit) = self.fixed.lock().unwrap().get(&f.digest) {
@@ -90,23 +108,27 @@ impl LinkStore {
         fixed
     }
 
-    /// Copy `host` to `.links/<digest>` at 0555. Staged under a unique name and renamed in, so two
-    /// creates racing on one digest cannot show each other a half-written file.
+    /// Copy `host` to `.links/<digest>` at 0555. Staged under a unique name and linked in so two
+    /// creates racing on one digest neither show each other a half-written file nor unlink an
+    /// already-published inode while a peer is mid-`linkat`.
     fn mint(&self, digest: &str, host: &Path) -> io::Result<PathBuf> {
         let final_path = self.root.join(digest);
         if final_path.exists() {
             return Ok(final_path);
         }
-        let tmp = self.root.join(format!("{digest}.tmp.{}", self.seq.fetch_add(1, Ordering::Relaxed)));
-        std::fs::copy(host, &tmp).map_err(|e| io::Error::new(e.kind(), format!("mint {} from {}: {e}", digest, host.display())))?;
+        let tmp =
+            self.root.join(format!("{digest}.tmp.{}", self.seq.fetch_add(1, Ordering::Relaxed)));
+        std::fs::copy(host, &tmp).map_err(|e| {
+            io::Error::new(e.kind(), format!("mint {} from {}: {e}", digest, host.display()))
+        })?;
         fsops::set_mode(&tmp, 0o555)?;
-        match std::fs::rename(&tmp, &final_path) {
+        let res = match std::fs::hard_link(&tmp, &final_path) {
             Ok(()) => Ok(final_path),
-            Err(e) => {
-                let _ = fsops::remove(&tmp);
-                Err(io::Error::new(e.kind(), format!("publish {digest}: {e}")))
-            }
-        }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(final_path),
+            Err(e) => Err(io::Error::new(e.kind(), format!("publish {digest}: {e}"))),
+        };
+        let _ = fsops::remove(&tmp);
+        res
     }
 }
 
@@ -119,13 +141,19 @@ fn join_rel(rel: &str, name: &str) -> String {
     }
 }
 
-/// Where a leaf's bytes live on the host. A captured `host_path` wins; otherwise the leaf sits at
-/// the `exec_root/<tree path>` derivation, built here so only files actually placed allocate one.
-fn file_host(f: &File, exec_root: &str, rel: &str) -> String {
+/// Where a leaf's bytes live on the host. A captured `host_path` wins; in `--cas_root` mode the
+/// leaf sits at `<cas_root>/<digest[0..2]>/<digest>`; otherwise it sits at the
+/// `exec_root/<tree path>` derivation, built here so only files actually placed allocate one.
+fn file_host(f: &File, cx: &Context, rel: &str) -> String {
     if !f.host_path.is_empty() {
         return f.host_path.clone();
     }
-    format!("{exec_root}/{}", join_rel(rel, &f.name))
+    if let Some(cas_root) = cx.cas_root {
+        if f.digest.len() >= 2 {
+            return cas_root.join(&f.digest[..2]).join(&f.digest).to_string_lossy().into_owned();
+        }
+    }
+    format!("{}/{}", cx.exec_root, join_rel(rel, &f.name))
 }
 
 /// Where a runfiles leaf's content really lives on the host.
@@ -157,8 +185,34 @@ fn farm_candidates(exec_root: &str, tree_path: &str) -> Vec<String> {
 /// answers, and it cannot be predicted — the signed system volume is firmlinked into the data
 /// volume, so `st_dev` matches and only the attempt tells you. A symlink is the only correct
 /// fallback there: a *copy* of a platform binary is killed on exec, while a symlink to it runs.
-fn place_file(f: &File, rel: &str, dir_fd: &OwnedFd, fs_path: &Path, cx: &Context) -> io::Result<()> {
-    let host = file_host(f, cx.exec_root, rel);
+fn place_file(
+    f: &File,
+    rel: &str,
+    dir_fd: &OwnedFd,
+    fs_path: &Path,
+    cx: &Context,
+) -> io::Result<()> {
+    if f.host_path.is_empty() && (f.size == 0 || f.digest == EMPTY_DIRECTORY_DIGEST) {
+        if let Some(empty) = cx.empty_file {
+            if cx.verified_mode
+                || cx.cas_root.is_some()
+                || !Path::new(&file_host(f, cx, rel)).exists()
+            {
+                return attach(empty, dir_fd, &f.name, fs_path);
+            }
+        }
+    }
+    if cx.verified_mode && cx.cas_root.is_none() && f.host_path.is_empty() {
+        if !f.digest.is_empty() {
+            cx.missing.record(&f.digest);
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("unverified empty digest for {}", f.name),
+        ));
+    }
+    let host = file_host(f, cx, rel);
     let host = PathBuf::from(host);
     let source: Cow<Path> = match cx.links.source_for(f, &host) {
         Some(p) => Cow::Owned(p),
@@ -166,9 +220,11 @@ fn place_file(f: &File, rel: &str, dir_fd: &OwnedFd, fs_path: &Path, cx: &Contex
     };
     match attach(&source, dir_fd, &f.name, fs_path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            for retry in farm_candidates(cx.exec_root, &join_rel(rel, &f.name)) {
-                if attach(Path::new(&retry), dir_fd, &f.name, fs_path).is_ok() {
-                    return Ok(());
+            if !cx.verified_mode && cx.cas_root.is_none() {
+                for retry in farm_candidates(cx.exec_root, &join_rel(rel, &f.name)) {
+                    if attach(Path::new(&retry), dir_fd, &f.name, fs_path).is_ok() {
+                        return Ok(());
+                    }
                 }
             }
             if f.digest.is_empty() {
@@ -283,7 +339,11 @@ fn reconcile_dir(
         None => (HashMap::new(), HashMap::new(), HashMap::new()),
     };
 
-    if new.files.is_empty() && new.directories.is_empty() && new.symlinks.is_empty() {
+    let is_mirrored_leaf_dir = new.files.is_empty()
+        && new.directories.is_empty()
+        && new.symlinks.is_empty()
+        && mirror_source(new).is_some();
+    if is_mirrored_leaf_dir {
         // Described only by where it lives on the host. Mirror it, but never over content that is
         // already here: an ancestor may have placed the real thing already.
         if let Some(host) = mirror_source(new) {
@@ -295,12 +355,15 @@ fn reconcile_dir(
 
     let mut keep: HashSet<&str> = HashSet::new();
 
-    for f in &new.files {
+    for f in new.files.iter() {
         keep.insert(&f.name);
         let existed = of.get(f.name.as_str());
         if let Some(o) = existed {
             if !f.digest.is_empty() && o.digest == f.digest {
-                continue; // unchanged — leave the existing link, and its warm vnode, alone
+                if !cx.heal_untracked || fsops::is_regular_file_at(&dir_fd, &f.name) {
+                    continue; // unchanged — leave the existing link, and its warm vnode, alone
+                }
+                REPAIRED_FILES.fetch_add(1, Ordering::Relaxed);
             }
         }
         if existed.is_some() {
@@ -309,7 +372,7 @@ fn reconcile_dir(
         place_file(f, rel, &dir_fd, fs_path, cx)?;
     }
 
-    for s in &new.symlinks {
+    for s in new.symlinks.iter() {
         keep.insert(&s.name);
         if os.get(s.name.as_str()).is_some_and(|o| o.target == s.target) {
             continue;
@@ -332,29 +395,74 @@ fn reconcile_dir(
     // A child is provably absent if this directory is known-absent, or if it came from the old
     // manifest, where disk matches the listing.
     let child_fresh = known_absent || old.is_some();
-    for nd in &new.directories {
+    for nd in new.directories.iter() {
         keep.insert(&nd.name);
         let target = fs_path.join(&nd.name);
         let child_rel = join_rel(rel, &nd.name);
         match od.get(nd.name.as_str()) {
-            Some(o) => reconcile_dir(Some(o), nd, &target, Some(&dir_fd), &nd.name, &child_rel, false, cx)?,
+            Some(o) => {
+                if !nd.digest.is_empty()
+                    && nd.digest != EMPTY_DIRECTORY_DIGEST
+                    && o.digest == nd.digest
+                    && (!cx.heal_untracked || target.is_dir())
+                {
+                    SKIPPED_SUBTREES.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                reconcile_dir(
+                    Some(o),
+                    nd,
+                    &target,
+                    Some(&dir_fd),
+                    &nd.name,
+                    &child_rel,
+                    false,
+                    cx,
+                )?;
+            }
             None => {
                 // An entry that describes nothing — no children, no host — cannot be rebuilt
                 // "from" itself. If content is already here, placed by an ancestor's mirror, that
                 // IS the content, and starting over would replace it with nothing.
-                let uninformative =
-                    nd.files.is_empty() && nd.directories.is_empty() && nd.symlinks.is_empty() && mirror_source(nd).is_none();
+                let uninformative = nd.files.is_empty()
+                    && nd.directories.is_empty()
+                    && nd.symlinks.is_empty()
+                    && mirror_source(nd).is_none();
                 if uninformative && fsops::has_real_content(&target) {
                     continue;
                 }
-                reconcile_dir(None, nd, &target, Some(&dir_fd), &nd.name, &child_rel, child_fresh, cx)?;
+                reconcile_dir(
+                    None,
+                    nd,
+                    &target,
+                    Some(&dir_fd),
+                    &nd.name,
+                    &child_rel,
+                    child_fresh,
+                    cx,
+                )?;
             }
         }
     }
 
     for name in of.keys().chain(os.keys()).chain(od.keys()) {
         if !keep.contains(name) {
+            REMOVED_ENTRIES.fetch_add(1, Ordering::Relaxed);
             fsops::remove_at(&dir_fd, name, &fs_path.join(name))?;
+        }
+    }
+
+    // Self-heal any undeclared scratch files left behind in a warm directory by a prior action.
+    if cx.heal_untracked && old.is_some() && !is_mirrored_leaf_dir {
+        if let Ok(entries) = std::fs::read_dir(fs_path) {
+            for entry in entries.flatten() {
+                if let Some(ename) = entry.file_name().to_str() {
+                    if !keep.contains(ename) {
+                        REMOVED_ENTRIES.fetch_add(1, Ordering::Relaxed);
+                        let _ = fsops::remove_at(&dir_fd, ename, &fs_path.join(ename));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -371,7 +479,11 @@ fn join_under(root: &Path, sandbox_path: &str) -> PathBuf {
 /// that was a prior action's output can be the new action's input (a generated file consumed
 /// downstream), and reconcile re-materializes it — so clearing afterwards would delete the freshly
 /// placed input.
-pub fn clear_outputs(outputs: &BTreeMap<String, String>, writable_dirs: &BTreeMap<String, String>, fs_root: &Path) -> io::Result<()> {
+pub fn clear_outputs(
+    outputs: &BTreeMap<String, String>,
+    writable_dirs: &BTreeMap<String, String>,
+    fs_root: &Path,
+) -> io::Result<()> {
     for p in outputs.keys().chain(writable_dirs.keys()) {
         fsops::remove(&join_under(fs_root, p))?;
     }
@@ -456,13 +568,18 @@ mod tests {
     use super::*;
     use backend::tree::Symlink;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::sync::Arc;
 
     fn ino(p: &Path) -> u64 {
         std::fs::symlink_metadata(p).unwrap().ino()
     }
 
     fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("hlmorph-{tag}-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let p = std::env::temp_dir().join(format!(
+            "hlmorph-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -473,13 +590,18 @@ mod tests {
         let p = exec_root.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, body).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(if exec { 0o755 } else { 0o644 })).unwrap();
+        std::fs::set_permissions(
+            &p,
+            std::fs::Permissions::from_mode(if exec { 0o755 } else { 0o644 }),
+        )
+        .unwrap();
         File {
             name: Path::new(rel).file_name().unwrap().to_string_lossy().into_owned(),
             digest: format!("d{}", body.len()),
             host_path: String::new(),
             size: body.len() as u64,
             executable: exec,
+            from_verified_host: false,
         }
     }
 
@@ -503,7 +625,15 @@ mod tests {
         fn morph(&self, old: Option<&Dir>, new: &Dir) -> Vec<String> {
             let missing = Missing::default();
             let er = self.exec_root.to_string_lossy().into_owned();
-            let cx = Context { exec_root: &er, links: &self.links, missing: &missing };
+            let cx = Context {
+                exec_root: &er,
+                links: &self.links,
+                missing: &missing,
+                empty_file: None,
+                verified_mode: false,
+                cas_root: None,
+                heal_untracked: false,
+            };
             reconcile(old, new, &self.slot, &cx).unwrap();
             missing.take()
         }
@@ -520,10 +650,13 @@ mod tests {
     fn unchanged_digest_keeps_its_inode() {
         let f = Fixture::new("unchanged");
         let a = host_file(&f.exec_root, "pkg/a.txt", b"aaa", false);
-        let tree = Dir { files: vec![a.clone()], ..Default::default() };
-        let nested = Dir { name: "pkg".into(), digest: "dp".into(), files: vec![a.clone()], ..Default::default() };
-        let root = Dir { directories: vec![nested.clone()], ..Default::default() };
-        let _ = tree;
+        let nested = Dir {
+            name: "pkg".into(),
+            digest: "dp".into(),
+            files: Arc::new(vec![a.clone()]),
+            ..Default::default()
+        };
+        let root = Dir { directories: Arc::new(vec![nested]), ..Default::default() };
 
         f.morph(None, &root);
         let placed = f.slot.join("pkg/a.txt");
@@ -540,14 +673,14 @@ mod tests {
         let f = Fixture::new("changed");
         let a = host_file(&f.exec_root, "a.txt", b"aaa", false);
         let b = host_file(&f.exec_root, "b.txt", b"bbbb", false);
-        let old = Dir { files: vec![a.clone(), b.clone()], ..Default::default() };
+        let old = Dir { files: Arc::new(vec![a.clone(), b]), ..Default::default() };
         f.morph(None, &old);
         assert!(f.slot.join("b.txt").exists());
 
         // Same name, new content: a fresh host inode under the same derivation.
         std::fs::write(f.exec_root.join("a.txt"), b"aaaaa").unwrap();
-        let a2 = File { digest: "d5".into(), size: 5, ..a.clone() };
-        let new = Dir { files: vec![a2], ..Default::default() };
+        let a2 = File { digest: "d5".into(), size: 5, ..a };
+        let new = Dir { files: Arc::new(vec![a2]), ..Default::default() };
         f.morph(Some(&old), &new);
 
         assert_eq!(ino(&f.slot.join("a.txt")), ino(&f.exec_root.join("a.txt")));
@@ -564,12 +697,16 @@ mod tests {
         std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o644)).unwrap();
         leaf.executable = true;
 
-        let root = Dir { files: vec![leaf], ..Default::default() };
+        let root = Dir { files: Arc::new(vec![leaf]), ..Default::default() };
         f.morph(None, &root);
 
         let placed = f.slot.join("tool");
         assert_eq!(std::fs::metadata(&placed).unwrap().permissions().mode() & 0o777, 0o555);
-        assert_ne!(ino(&placed), ino(&host), "must not share the host inode, or chmod would have hit it");
+        assert_ne!(
+            ino(&placed),
+            ino(&host),
+            "must not share the host inode, or chmod would have hit it"
+        );
         assert_eq!(
             std::fs::metadata(&host).unwrap().permissions().mode() & 0o777,
             0o644,
@@ -583,7 +720,7 @@ mod tests {
     fn executable_with_host_exec_bit_links() {
         let f = Fixture::new("modeok");
         let leaf = host_file(&f.exec_root, "tool", b"#!/bin/sh\n", true);
-        let root = Dir { files: vec![leaf], ..Default::default() };
+        let root = Dir { files: Arc::new(vec![leaf]), ..Default::default() };
         f.morph(None, &root);
         assert_eq!(ino(&f.slot.join("tool")), ino(&f.exec_root.join("tool")));
     }
@@ -596,7 +733,7 @@ mod tests {
         fsops::mkdir_p(&f.slot).unwrap();
         std::fs::write(f.slot.join("a.txt"), b"garbage").unwrap();
 
-        let root = Dir { files: vec![a], ..Default::default() };
+        let root = Dir { files: Arc::new(vec![a]), ..Default::default() };
         f.morph(None, &root);
         assert_eq!(std::fs::read(f.slot.join("a.txt")).unwrap(), b"aaa");
     }
@@ -605,11 +742,17 @@ mod tests {
     #[test]
     fn symlink_written_and_retargeted() {
         let f = Fixture::new("symlink");
-        let old = Dir { symlinks: vec![Symlink { name: "s".into(), target: "one".into() }], ..Default::default() };
+        let old = Dir {
+            symlinks: Arc::new(vec![Symlink { name: "s".into(), target: "one".into() }]),
+            ..Default::default()
+        };
         f.morph(None, &old);
         assert_eq!(std::fs::read_link(f.slot.join("s")).unwrap().to_str(), Some("one"));
 
-        let new = Dir { symlinks: vec![Symlink { name: "s".into(), target: "two".into() }], ..Default::default() };
+        let new = Dir {
+            symlinks: Arc::new(vec![Symlink { name: "s".into(), target: "two".into() }]),
+            ..Default::default()
+        };
         f.morph(Some(&old), &new);
         assert_eq!(std::fs::read_link(f.slot.join("s")).unwrap().to_str(), Some("two"));
     }
@@ -618,8 +761,9 @@ mod tests {
     #[test]
     fn unsourceable_leaf_is_reported_missing() {
         let f = Fixture::new("missing");
-        let ghost = File { name: "ghost".into(), digest: "dead".into(), size: 3, ..Default::default() };
-        let root = Dir { files: vec![ghost], ..Default::default() };
+        let ghost =
+            File { name: "ghost".into(), digest: "dead".into(), size: 3, ..Default::default() };
+        let root = Dir { files: Arc::new(vec![ghost]), ..Default::default() };
         assert_eq!(f.morph(None, &root), vec!["dead".to_string()]);
     }
 
@@ -639,7 +783,7 @@ mod tests {
             host_path: src.to_string_lossy().into_owned(),
             ..Default::default()
         };
-        let root = Dir { directories: vec![art], ..Default::default() };
+        let root = Dir { directories: Arc::new(vec![art]), ..Default::default() };
         f.morph(None, &root);
 
         assert_eq!(ino(&f.slot.join("art/top.txt")), ino(&src.join("top.txt")));
@@ -654,7 +798,7 @@ mod tests {
         std::fs::write(f.slot.join("d/kept.txt"), b"real").unwrap();
 
         let empty_child = Dir { name: "d".into(), digest: String::new(), ..Default::default() };
-        let root = Dir { directories: vec![empty_child], ..Default::default() };
+        let root = Dir { directories: Arc::new(vec![empty_child]), ..Default::default() };
         f.morph(None, &root);
         assert_eq!(std::fs::read(f.slot.join("d/kept.txt")).unwrap(), b"real");
     }
@@ -668,11 +812,15 @@ mod tests {
         std::fs::write(&leaf, b"stale").unwrap();
         fsops::set_mode(&leaf, 0o555).unwrap();
 
-        let outputs = BTreeMap::from([("/_main/bazel-out/x/out.o".to_string(), "file".to_string())]);
+        let outputs =
+            BTreeMap::from([("/_main/bazel-out/x/out.o".to_string(), "file".to_string())]);
         let writable = BTreeMap::from([("/tmp".to_string(), String::new())]);
         prepare_outputs(&outputs, &writable, &f.slot).unwrap();
 
-        assert!(!leaf.exists(), "a stale read-only leaf must be unlinked, not left to fail the action");
+        assert!(
+            !leaf.exists(),
+            "a stale read-only leaf must be unlinked, not left to fail the action"
+        );
         assert!(leaf.parent().unwrap().is_dir());
         assert!(f.slot.join("tmp").is_dir(), "an absolute writable dir stays inside the slot");
     }
@@ -696,7 +844,10 @@ mod tests {
         let dest_root = f.base.join("out");
         collect_outputs(&outputs, &dests, &f.slot, &dest_root).unwrap();
 
-        assert_eq!(std::fs::read(dest_root.join("_main/bazel-out/unmapped/lib.a")).unwrap(), b"archive");
+        assert_eq!(
+            std::fs::read(dest_root.join("_main/bazel-out/unmapped/lib.a")).unwrap(),
+            b"archive"
+        );
         assert!(!produced.exists(), "collect moves, it does not copy");
     }
 }

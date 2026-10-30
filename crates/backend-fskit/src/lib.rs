@@ -161,7 +161,7 @@ fn farm_candidates(exec_root: &str, tree_path: &str) -> Vec<String> {
 /// `MissingContent`, which Bazel answers by pushing the bytes (they exist only inside Bazel --
 /// `bazel_tools`' own runfiles.bash is never written to an exec root at all).
 fn bind_farm_leaves(exec_root: &str, dir: &mut Dir, path: &str, store: &BlobStore, missing: &mut Vec<String>) {
-    for f in &mut dir.files {
+    for f in Arc::make_mut(&mut dir.files) {
         let tree_path = if path.is_empty() { f.name.clone() } else { format!("{path}/{}", f.name) };
         if !f.host_path.is_empty() || f.digest.is_empty() || !tree_path.contains(".runfiles/") {
             continue;
@@ -182,7 +182,7 @@ fn bind_farm_leaves(exec_root: &str, dir: &mut Dir, path: &str, store: &BlobStor
             None => missing.push(f.digest.clone()),
         }
     }
-    for sub in &mut dir.directories {
+    for sub in Arc::make_mut(&mut dir.directories) {
         let sub_path = if path.is_empty() { sub.name.clone() } else { format!("{path}/{}", sub.name) };
         bind_farm_leaves(exec_root, sub, &sub_path, store, missing);
     }

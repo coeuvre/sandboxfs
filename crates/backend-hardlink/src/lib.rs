@@ -10,11 +10,11 @@
 //! faulted in, and an executable carries the code signature the kernel already validated. The cost
 //! is that a link shares its inode's permission bits, which is why `morph::LinkStore` exists.
 
-mod fsops;
-mod morph;
+pub mod fsops;
+pub mod morph;
 mod slots;
 
-use backend::tree::{self, Dir};
+use backend::tree::{self, Dir, EMPTY_DIRECTORY_DIGEST};
 use backend::wire::sha256_hex;
 use backend::{Backend, BlobStore, ContentSource, CreateError, Manifest, Options};
 use morph::{Context, LinkStore, Missing};
@@ -22,6 +22,7 @@ use slots::{Prior, SlotTable};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Where this workspace's pool lives. Deterministic across restarts, and readable enough to debug:
@@ -40,10 +41,15 @@ fn workspace_key(workspace: &str) -> String {
 
 /// The daemon's one call into this backend. `pool_root=<path>` moves the whole tree, which has to
 /// stay on the workspace's volume: `link` is same-device-only and `collect` renames out of a slot.
-pub fn open(workspace: &str, options: &Options) -> io::Result<Arc<dyn Backend>> {
+pub fn open(workspace: &str, options: &Options) -> io::Result<Arc<Hardlink>> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let base = options.pool_root.clone().unwrap_or_else(|| PathBuf::from(home).join(".sandboxfs/hardlink"));
-    Ok(Arc::new(Hardlink::open(&base, workspace)?))
+    let base = options
+        .pool_root
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(home).join(".sandboxfs/hardlink"));
+    let hl = Hardlink::open(&base, workspace)?;
+    hl.heal_untracked.store(options.metrics, Ordering::Release);
+    Ok(Arc::new(hl))
 }
 
 /// What a live sandbox needs remembered between `create` and `collect`.
@@ -54,13 +60,16 @@ struct Live {
 }
 
 pub struct Hardlink {
+    base: PathBuf,
     root: PathBuf,
     slots_dir: PathBuf,
     /// Leaves Bazel pushed ahead of the creates that name them, pinned for the session.
     content: PathBuf,
+    empty_file: PathBuf,
     links: LinkStore,
     table: Mutex<SlotTable>,
     live: Mutex<HashMap<String, Live>>,
+    heal_untracked: AtomicBool,
 }
 
 impl Hardlink {
@@ -76,21 +85,58 @@ impl Hardlink {
             let graveyard = root.join(format!(".dead.{}", std::process::id()));
             if std::fs::rename(&slots_dir, &graveyard).is_ok() {
                 std::thread::spawn(move || {
-                    let _ = std::fs::remove_dir_all(&graveyard);
+                    let _ = fsops::remove(&graveyard);
                 });
             }
         }
-        for d in [&slots_dir, &content] {
+        for d in [base, &slots_dir, &content] {
             fsops::mkdir_p(d)?;
         }
+        let empty_file = content.join(EMPTY_DIRECTORY_DIGEST);
+        if !empty_file.exists() {
+            std::fs::write(&empty_file, b"")?;
+        }
+        // Provide a stable `<base>/slots` symlink pointing to the workspace's `slots_dir` for
+        // external callers and integration tests inspecting slots under `pool_root`.
+        let base_slots_link = base.join("slots");
+        let _ = fsops::remove(&base_slots_link);
+        let _ = std::os::unix::fs::symlink(&slots_dir, &base_slots_link);
+
         Ok(Hardlink {
+            base: base.to_path_buf(),
             links: LinkStore::new(root.join(".links"))?,
             root,
             slots_dir,
             content,
+            empty_file,
             table: Mutex::new(SlotTable::default()),
             live: Mutex::new(HashMap::new()),
+            heal_untracked: AtomicBool::new(false),
         })
+    }
+
+    pub fn base_path(&self) -> &Path {
+        &self.base
+    }
+
+    pub fn slot_metrics(&self) -> (usize, u64, u64, u64, u64) {
+        let t = self.table.lock().unwrap();
+        (
+            t.total_allocated(),
+            t.reuse_count(),
+            morph::SKIPPED_SUBTREES.load(Ordering::Relaxed),
+            morph::REMOVED_ENTRIES.load(Ordering::Relaxed),
+            morph::REPAIRED_FILES.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Invalidate a slot's cached tree listing (e.g. when post-execution verification detects that
+    /// an action modified a hardlinked input file inside the slot).
+    pub fn invalidate_slot_for(&self, sandbox_id: &str) {
+        let slot = self.live.lock().unwrap().get(sandbox_id).map(|l| l.slot);
+        if let Some(s) = slot {
+            self.table.lock().unwrap().occupy(s, "", "", Prior::default());
+        }
     }
 
     fn slot_path(&self, n: usize) -> PathBuf {
@@ -108,10 +154,20 @@ impl Hardlink {
         exec_root: &str,
         outputs: &BTreeMap<String, String>,
         writable: &BTreeMap<String, String>,
+        verified_mode: bool,
+        cas_root: Option<&Path>,
     ) -> io::Result<Vec<String>> {
         morph::clear_outputs(&prior.outputs, &prior.writable, slot_root)?;
         let missing = Missing::default();
-        let cx = Context { exec_root, links: &self.links, missing: &missing };
+        let cx = Context {
+            exec_root,
+            links: &self.links,
+            missing: &missing,
+            empty_file: Some(&self.empty_file),
+            verified_mode,
+            cas_root,
+            heal_untracked: self.heal_untracked.load(Ordering::Acquire),
+        };
         morph::reconcile(prior.tree.as_deref(), new, slot_root, &cx)?;
         let missing = missing.take();
         if missing.is_empty() {
@@ -137,19 +193,38 @@ impl Backend for Hardlink {
         &self.root
     }
 
-    fn create(&self, sandbox_id: &str, manifest: &Manifest<'_>, store: &BlobStore) -> Result<String, CreateError> {
+    fn create(
+        &self,
+        sandbox_id: &str,
+        manifest: &Manifest<'_>,
+        store: &BlobStore,
+    ) -> Result<String, CreateError> {
         let root_digest = manifest.input_root_digest();
         let exec_root = manifest.exec_root().unwrap_or_default();
-        let identity = manifest.first_output().unwrap_or_default().to_string();
+        let identity = manifest
+            .first_output()
+            .or_else(|| manifest.mnemonic())
+            .unwrap_or("default")
+            .to_string();
         let tree = tree::resolve(root_digest, manifest.exec_root(), store)?;
         let new = tree.map(Arc::new).unwrap_or_default();
 
         let declared = manifest.outputs();
         let writable = manifest.writable_dirs();
+        let cas_root = store.cas_root();
 
         let (slot, prior) = self.table.lock().unwrap().claim(root_digest, &identity);
         let slot_root = self.slot_path(slot);
-        let outcome = self.project(&slot_root, &prior, &new, exec_root, &declared.kinds, writable);
+        let outcome = self.project(
+            &slot_root,
+            &prior,
+            &new,
+            exec_root,
+            &declared.kinds,
+            writable,
+            store.is_verified_mode(),
+            cas_root.as_deref(),
+        );
 
         // Anything short of a finished morph forfeits the slot's listing: the next create must
         // treat what is on disk as unknown rather than trust a tree that was never fully placed.
@@ -207,7 +282,9 @@ impl Backend for Hardlink {
             let captured = match source {
                 ContentSource::Location(path) => {
                     let _ = fsops::remove(&pinned);
-                    std::fs::hard_link(&path, &pinned).or_else(|_| std::fs::copy(&path, &pinned).map(|_| ())).is_ok()
+                    std::fs::hard_link(&path, &pinned)
+                        .or_else(|_| std::fs::copy(&path, &pinned).map(|_| ()))
+                        .is_ok()
                 }
                 // A virtual input (a param file): no host path ever existed, so this IS the copy.
                 ContentSource::Inline(bytes) => std::fs::write(&pinned, bytes).is_ok(),
@@ -222,7 +299,6 @@ impl Backend for Hardlink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use backend::tree::File;
     use std::os::unix::fs::MetadataExt;
 
     fn tmp(tag: &str) -> PathBuf {
@@ -254,7 +330,11 @@ mod tests {
 
     /// REAPI `Directory{ files = 1, directories = 2 }`, as Bazel ships it. `resolve` verifies the
     /// root blob against the digest that names it, so every blob is published under its own hash.
-    fn publish(store: &BlobStore, files: &[(&str, &str, u64, bool)], subdirs: &[(&str, &str)]) -> String {
+    fn publish(
+        store: &BlobStore,
+        files: &[(&str, &str, u64, bool)],
+        subdirs: &[(&str, &str)],
+    ) -> String {
         use backend::wire::Writer;
         let node = |name: &str, hash: &str, size: u64| {
             let mut n = Writer::default();
@@ -295,7 +375,11 @@ mod tests {
         let main = publish(&store, &[], &[("pkg", &pkg)]);
         let root = publish(&store, &[], &[("_main", &main)]);
 
-        let bytes = manifest_bytes(exec_root.to_str().unwrap(), &root, &[("/_main/bazel-out/out.txt", "file")]);
+        let bytes = manifest_bytes(
+            exec_root.to_str().unwrap(),
+            &root,
+            &[("/_main/bazel-out/out.txt", "file")],
+        );
         let m = Manifest::new(&bytes);
 
         let path = fs.create("sb1", &m, &store).unwrap();

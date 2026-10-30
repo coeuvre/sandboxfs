@@ -1,5 +1,5 @@
 use crate::blobstore::BlobStore;
-use crate::wire::{digest_hash, parse_digest, parse_map_entry, sha256_hex, string, Reader, Writer};
+use crate::wire::{parse_digest, parse_map_entry, sha256_hex, string, Reader, Writer};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 
@@ -49,9 +49,9 @@ pub struct Dir {
     pub host_path: String,
     /// Why `host_path` is set; `None` iff `host_path` is empty.
     pub host_kind: DirHostKind,
-    pub files: Vec<File>,
-    pub directories: Vec<Dir>,
-    pub symlinks: Vec<Symlink>,
+    pub files: Arc<Vec<File>>,
+    pub directories: Arc<Vec<Dir>>,
+    pub symlinks: Arc<Vec<Symlink>>,
     /// Where this dir's content probably lives, when it carries the empty digest but sits under a
     /// runfiles farm. UNVERIFIED: the morph layer must confirm content is really there. Kept out of
     /// `host_path` precisely so it cannot skip that check.
@@ -67,6 +67,11 @@ pub struct File {
     pub host_path: String,
     pub size: u64,
     pub executable: bool,
+    /// True when `host_path` came from a verified host file registered via REAPI v2
+    /// `instance_name = "local-file-paths"`. Because `MerkleTreeComputer` sets
+    /// `FileNode.is_executable = true` on all files in `v2.Directory`, verified host files keep
+    /// their authoritative host mode and inode rather than being copied into `LinkStore`.
+    pub from_verified_host: bool,
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -77,25 +82,163 @@ pub struct Symlink {
 
 /// Resolve the tree named by `root_digest`, walking its `Directory` closure out of the store.
 /// `None` when no tree was named. `MissingContent` names every digest the store lacked.
-pub fn resolve(root_digest: &str, exec_root: Option<&str>, store: &BlobStore) -> Result<Option<Dir>, crate::CreateError> {
+pub fn resolve(
+    root_digest: &str,
+    exec_root: Option<&str>,
+    store: &BlobStore,
+) -> Result<Option<Dir>, crate::CreateError> {
     if root_digest.is_empty() {
         return Ok(None);
+    }
+    if store.has_cas_root() && !store.is_verified_mode() {
+        if root_digest == EMPTY_DIRECTORY_DIGEST {
+            return Ok(Some(Dir::default()));
+        }
+        let mut missing = Vec::new();
+        if let Some(dir) = resolve_cas_dir(root_digest, "", store, &mut missing) {
+            if missing.is_empty() {
+                return Ok(Some(dir));
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        return Err(crate::CreateError::MissingContent(missing));
     }
     let (collected, missing) = resolve_closure(root_digest, store);
     if !missing.is_empty() {
         return Err(crate::CreateError::MissingContent(missing));
     }
     // Borrow the resolved blobs for the shared walk; `collected` outlives it.
-    let view: HashMap<String, &[u8]> = collected.iter().map(|(k, v)| (k.clone(), v.as_ref())).collect();
-    build_root(root_digest, &view, Some(store), exec_root)
-        .map(Some)
-        .map_err(|e| crate::CreateError::Failed(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("input tree: {e}"))))
+    let view: HashMap<String, &[u8]> =
+        collected.iter().map(|(k, v)| (k.clone(), v.as_ref())).collect();
+    build_root(root_digest, &view, Some(store), exec_root).map(Some).map_err(|e| {
+        crate::CreateError::Failed(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("input tree: {e}"),
+        ))
+    })
+}
+
+fn resolve_cas_dir(
+    digest_hex: &str,
+    name: &str,
+    store: &BlobStore,
+    missing: &mut Vec<String>,
+) -> Option<Dir> {
+    if digest_hex == EMPTY_DIRECTORY_DIGEST {
+        return Some(Dir {
+            name: name.to_string(),
+            digest: digest_hex.to_string(),
+            ..Default::default()
+        });
+    }
+    if let Some(mut cached) = store.resolved_dir(digest_hex) {
+        if !name.is_empty() {
+            cached.name = name.to_string();
+        }
+        return Some(cached);
+    }
+    let Some(bytes) = store.dir(digest_hex) else {
+        missing.push(digest_hex.to_string());
+        return None;
+    };
+    let missing_before = missing.len();
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    let mut symlinks = Vec::new();
+    let mut r = Reader::new(&bytes);
+    while let Some((field, wire)) = r.next_key() {
+        match (field, wire) {
+            (1, 2) => {
+                if let Some(g) = r.len_slice() {
+                    if let Some(f) = parse_file_node(g, Some(store), None) {
+                        files.push(f);
+                    }
+                }
+            }
+            (2, 2) => {
+                if let Some(g) = r.len_slice() {
+                    if let Some((dn_name, dn_digest)) = parse_dir_node(g, true) {
+                        if let Some(child) = resolve_cas_dir(&dn_digest, &dn_name, store, missing) {
+                            directories.push(child);
+                        }
+                    }
+                }
+            }
+            (3, 2) => {
+                if let Some(g) = r.len_slice() {
+                    if let Some(s) = parse_symlink_node(g) {
+                        symlinks.push(s);
+                    }
+                }
+            }
+            (_, w) => r.skip(w),
+        }
+    }
+    if missing.len() != missing_before {
+        return None;
+    }
+    let d = Dir {
+        name: String::new(),
+        digest: digest_hex.to_string(),
+        files: Arc::new(files),
+        directories: Arc::new(directories),
+        symlinks: Arc::new(symlinks),
+        ..Default::default()
+    };
+    store.insert_resolved_dir(digest_hex.to_string(), d.clone());
+    let mut named = d;
+    if !name.is_empty() {
+        named.name = name.to_string();
+    }
+    Some(named)
+}
+
+/// Collects all leaf `FileNode` digests reachable from `root_digest_hex` in `store`.
+pub fn collect_file_digests(root_digest_hex: &str, store: &BlobStore) -> Vec<String> {
+    collect_file_digests_with_sizes(root_digest_hex, store).into_iter().map(|(dg, _)| dg).collect()
+}
+
+/// Collects all leaf `FileNode` `(digest, size)` pairs reachable from `root_digest_hex` in `store`.
+pub fn collect_file_digests_with_sizes(
+    root_digest_hex: &str,
+    store: &BlobStore,
+) -> Vec<(String, u64)> {
+    let (collected, _) = resolve_closure(root_digest_hex, store);
+    let mut out = Vec::new();
+    for bytes in collected.values() {
+        let mut r = Reader::new(bytes);
+        while let Some((field, wire)) = r.next_key() {
+            match (field, wire) {
+                (1, 2) => {
+                    if let Some(g) = r.len_slice() {
+                        if let Some(f) = parse_file_node(g, None, None) {
+                            if !f.digest.is_empty()
+                                && f.digest != EMPTY_DIRECTORY_DIGEST
+                                && f.size > 0
+                            {
+                                out.push((f.digest, f.size));
+                            }
+                        }
+                    }
+                }
+                (_, w) => r.skip(w),
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The blobs reachable from `root_digest_hex`, and the digests the store lacked. A missing blob
 /// hides its own descendants, so one pass may not surface every miss -- Bazel pushes what we report
 /// and retries, which converges in one round in practice.
-pub(crate) fn resolve_closure(root_digest_hex: &str, store: &BlobStore) -> (HashMap<String, Arc<[u8]>>, Vec<String>) {
+pub(crate) fn resolve_closure(
+    root_digest_hex: &str,
+    store: &BlobStore,
+) -> (HashMap<String, Arc<[u8]>>, Vec<String>) {
+    let verified_mode = store.is_verified_mode() || store.has_cas_root();
     let mut collected: HashMap<String, Arc<[u8]>> = HashMap::default();
     let mut missing: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::default();
@@ -109,7 +252,7 @@ pub(crate) fn resolve_closure(root_digest_hex: &str, store: &BlobStore) -> (Hash
         }
         match store.dir(&dg) {
             Some(bytes) => {
-                for child in child_dir_digests(&bytes) {
+                for child in child_dir_digests(&bytes, verified_mode) {
                     if child != EMPTY_DIRECTORY_DIGEST && !seen.contains(&child) {
                         stack.push(child);
                     }
@@ -124,14 +267,14 @@ pub(crate) fn resolve_closure(root_digest_hex: &str, store: &BlobStore) -> (Hash
 }
 
 /// Just the child digests -- enough to walk the closure before building the model.
-fn child_dir_digests(b: &[u8]) -> Vec<String> {
+fn child_dir_digests(b: &[u8], verified_mode: bool) -> Vec<String> {
     let mut r = Reader::new(b);
     let mut out = Vec::new();
     while let Some((field, wire)) = r.next_key() {
         match (field, wire) {
             (2, 2) => {
                 if let Some(g) = r.len_slice() {
-                    if let Some((_, dg)) = parse_dir_node(g) {
+                    if let Some((_, dg)) = parse_dir_node(g, verified_mode) {
                         out.push(dg);
                     }
                 }
@@ -158,11 +301,13 @@ pub(crate) fn build_root(
 
     // The one entry point worth verifying. Every other blob is trusted as shipped: re-hashing the
     // whole tree would be pure overhead.
-    let root_hash = sha256_hex(root_bytes);
-    if root_hash != root_digest_hex {
-        return Err(format!(
-            "root digest mismatch: input_root_digest says {root_digest_hex}, root blob hashes to {root_hash}"
-        ));
+    if !captured.map_or(false, |s| s.is_verified_mode() || s.has_cas_root()) {
+        let root_hash = sha256_hex(root_bytes);
+        if root_hash != root_digest_hex {
+            return Err(format!(
+                "root digest mismatch: input_root_digest says {root_digest_hex}, root blob hashes to {root_hash}"
+            ));
+        }
     }
 
     build_dir(root_bytes, "", root_digest_hex, directories, captured, exec_root, "")
@@ -181,6 +326,7 @@ pub(crate) fn build_dir(
     exec_root: Option<&str>,
     path: &str,
 ) -> Result<Dir, String> {
+    let verified_mode = captured.map_or(false, |s| s.is_verified_mode() || s.has_cas_root());
     let lookup = |dg: &str| -> Option<String> {
         if dg.is_empty() {
             return None;
@@ -193,6 +339,9 @@ pub(crate) fn build_dir(
         host_path: resolve_host(exec_root, lookup(digest_hex).as_deref()),
         ..Default::default()
     };
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    let mut symlinks = Vec::new();
     let mut marker_kind: Option<DirHostKind> = None;
     let mut r = Reader::new(b);
     while let Some((field, wire)) = r.next_key() {
@@ -200,13 +349,13 @@ pub(crate) fn build_dir(
             (1, 2) => {
                 if let Some(g) = r.len_slice() {
                     if let Some(f) = parse_file_node(g, captured, exec_root) {
-                        d.files.push(f);
+                        files.push(f);
                     }
                 }
             }
             (2, 2) => {
                 if let Some(g) = r.len_slice() {
-                    if let Some((dn_name, dn_digest)) = parse_dir_node(g) {
+                    if let Some((dn_name, dn_digest)) = parse_dir_node(g, verified_mode) {
                         let child_path = if path.is_empty() {
                             dn_name.clone()
                         } else {
@@ -218,17 +367,33 @@ pub(crate) fn build_dir(
                             // path says we are inside a farm, leave an unverified candidate.
                             let speculative_host_path = exec_root
                                 .filter(|_| !child_path.is_empty())
-                                .and_then(|er| strip_runfiles_prefix(&child_path).map(|tail| format!("{er}/{tail}")))
+                                .and_then(|er| {
+                                    strip_runfiles_prefix(&child_path)
+                                        .map(|tail| format!("{er}/{tail}"))
+                                })
                                 .unwrap_or_default();
-                            d.directories.push(Dir { name: dn_name, digest: dn_digest, speculative_host_path, ..Default::default() });
+                            directories.push(Dir {
+                                name: dn_name,
+                                digest: dn_digest,
+                                speculative_host_path,
+                                ..Default::default()
+                            });
                         } else {
                             // Any other absent digest is a missing blob. Failing here names it;
                             // materializing an empty Dir instead surfaces as execvp ENOENT later.
                             let cr = child_index.get(&dn_digest).ok_or_else(|| {
-                                format!("no directory blob for digest {dn_digest} (dir {child_path:?})")
+                                format!(
+                                    "no directory blob for digest {dn_digest} (dir {child_path:?})"
+                                )
                             })?;
-                            d.directories.push(build_dir(
-                                cr, &dn_name, &dn_digest, child_index, captured, exec_root, &child_path,
+                            directories.push(build_dir(
+                                cr,
+                                &dn_name,
+                                &dn_digest,
+                                child_index,
+                                captured,
+                                exec_root,
+                                &child_path,
                             )?);
                         }
                     }
@@ -237,7 +402,7 @@ pub(crate) fn build_dir(
             (3, 2) => {
                 if let Some(g) = r.len_slice() {
                     if let Some(s) = parse_symlink_node(g) {
-                        d.symlinks.push(s);
+                        symlinks.push(s);
                     }
                 }
             }
@@ -249,6 +414,9 @@ pub(crate) fn build_dir(
             (_, w) => r.skip(w),
         }
     }
+    d.files = Arc::new(files);
+    d.directories = Arc::new(directories);
+    d.symlinks = Arc::new(symlinks);
     if !d.host_path.is_empty() {
         d.host_kind = DirHostKind::Explicit;
     } else if let Some(kind) = marker_kind {
@@ -321,23 +489,43 @@ fn parse_file_node(
     if name.is_empty() {
         return None;
     }
-    let mapped = if digest.is_empty() {
+    let has_cas_root = captured.is_some_and(|s| s.has_cas_root());
+    let mut from_verified_host = has_cas_root;
+    let mapped = if digest.is_empty() || has_cas_root {
         None
+    } else if let Some(host) = captured.and_then(|s| s.resolve_verified_host(&digest)) {
+        from_verified_host = true;
+        Some(host)
     } else {
         captured.and_then(|s| s.captured(&digest))
     };
-    Some(File { host_path: resolve_host(exec_root, mapped.as_deref()), name, digest, size, executable: exec })
+    Some(File {
+        host_path: resolve_host(exec_root, mapped.as_deref()),
+        name,
+        digest,
+        size,
+        executable: exec,
+        from_verified_host,
+    })
 }
 
 /// `DirectoryNode{ string name = 1; Digest digest = 2; }`.
-fn parse_dir_node(b: &[u8]) -> Option<(String, String)> {
+fn parse_dir_node(b: &[u8], verified_mode: bool) -> Option<(String, String)> {
     let mut r = Reader::new(b);
     let mut name = String::new();
     let mut digest = String::new();
     while let Some((field, wire)) = r.next_key() {
         match (field, wire) {
             (1, 2) => name = string(r.len_slice()?),
-            (2, 2) => digest = digest_hash(r.len_slice()?).unwrap_or_default(),
+            (2, 2) => {
+                if let Some((h, s)) = parse_digest(r.len_slice()?) {
+                    digest = if verified_mode && s == 0 && !h.is_empty() {
+                        EMPTY_DIRECTORY_DIGEST.to_string()
+                    } else {
+                        h
+                    };
+                }
+            }
             (_, w) => r.skip(w),
         }
     }
@@ -368,19 +556,20 @@ pub fn encode(d: &Dir) -> Vec<u8> {
     w.str(3, &d.host_path);
     w.uint(4, d.host_kind as u64);
     w.str(5, &d.speculative_host_path);
-    for f in &d.files {
+    for f in d.files.iter() {
         let mut n = Writer::default();
         n.str(1, &f.name);
         n.str(2, &f.digest);
         n.str(3, &f.host_path);
         n.uint(4, f.size);
         n.bool(5, f.executable);
+        n.bool(6, f.from_verified_host);
         w.msg(6, &n.out);
     }
-    for sub in &d.directories {
+    for sub in d.directories.iter() {
         w.msg(7, &encode(sub));
     }
-    for s in &d.symlinks {
+    for s in d.symlinks.iter() {
         let mut n = Writer::default();
         n.str(1, &s.name);
         n.str(2, &s.target);
@@ -392,6 +581,9 @@ pub fn encode(d: &Dir) -> Vec<u8> {
 /// Inverse of `encode`.
 pub fn decode(b: &[u8]) -> Option<Dir> {
     let mut d = Dir::default();
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
+    let mut symlinks = Vec::new();
     let mut r = Reader::new(b);
     while let Some((field, wire)) = r.next_key() {
         match (field, wire) {
@@ -400,15 +592,18 @@ pub fn decode(b: &[u8]) -> Option<Dir> {
             (3, 2) => d.host_path = string(r.len_slice()?),
             (4, 0) => d.host_kind = host_kind(r.varint()),
             (5, 2) => d.speculative_host_path = string(r.len_slice()?),
-            (6, 2) => d.files.push(decode_file(r.len_slice()?)?),
-            (7, 2) => d.directories.push(decode(r.len_slice()?)?),
+            (6, 2) => files.push(decode_file(r.len_slice()?)?),
+            (7, 2) => directories.push(decode(r.len_slice()?)?),
             (8, 2) => {
                 let (name, target) = parse_map_entry(r.len_slice()?)?;
-                d.symlinks.push(Symlink { name, target });
+                symlinks.push(Symlink { name, target });
             }
             (_, w) => r.skip(w),
         }
     }
+    d.files = Arc::new(files);
+    d.directories = Arc::new(directories);
+    d.symlinks = Arc::new(symlinks);
     r.ok.then_some(d)
 }
 
@@ -422,6 +617,7 @@ fn decode_file(b: &[u8]) -> Option<File> {
             (3, 2) => f.host_path = string(r.len_slice()?),
             (4, 0) => f.size = r.varint(),
             (5, 0) => f.executable = r.varint() != 0,
+            (6, 0) => f.from_verified_host = r.varint() != 0,
             (_, w) => r.skip(w),
         }
     }
@@ -709,9 +905,21 @@ mod tests {
             digest: "wire-root".into(),
             host_path: "/host/root".into(),
             host_kind: DirHostKind::TreeArtifact,
-            files: vec![File { name: "a.c".into(), digest: "fdg".into(), host_path: "/host/a.c".into(), size: 3, executable: true }],
-            directories: vec![Dir { name: "sub".into(), digest: "sub-dg".into(), speculative_host_path: "/spec".into(), ..Default::default() }],
-            symlinks: vec![Symlink { name: "l".into(), target: "a.c".into() }],
+            files: Arc::new(vec![File {
+                name: "a.c".into(),
+                digest: "fdg".into(),
+                host_path: "/host/a.c".into(),
+                size: 3,
+                executable: true,
+                from_verified_host: true,
+            }]),
+            directories: Arc::new(vec![Dir {
+                name: "sub".into(),
+                digest: "sub-dg".into(),
+                speculative_host_path: "/spec".into(),
+                ..Default::default()
+            }]),
+            symlinks: Arc::new(vec![Symlink { name: "l".into(), target: "a.c".into() }]),
             ..Default::default()
         };
         assert_eq!(decode(&encode(&d)).expect("round trip"), d);

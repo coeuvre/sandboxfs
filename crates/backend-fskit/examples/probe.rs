@@ -16,19 +16,19 @@ fn field<'a>(bytes: &'a [u8], want: u64) -> Option<&'a [u8]> {
 }
 
 fn walk(d: &Dir, path: &str, want: &str) {
-    for f in &d.files {
+    for f in d.files.iter() {
         let p = format!("{path}/{}", f.name);
         if p.contains(want) {
             println!("FILE {p}\n     digest={} size={} exec={} host={:?}", &f.digest[..12.min(f.digest.len())], f.size, f.executable, f.host_path);
         }
     }
-    for s in &d.symlinks {
+    for s in d.symlinks.iter() {
         let p = format!("{path}/{}", s.name);
         if p.contains(want) {
             println!("LINK {p} -> {}", s.target);
         }
     }
-    for sub in &d.directories {
+    for sub in d.directories.iter() {
         let p = format!("{path}/{}", sub.name);
         if p.contains(want) && sub.files.is_empty() && sub.directories.is_empty() && sub.symlinks.is_empty() {
             println!("DIR  {p} (EMPTY) digest={} host={:?} speculative={:?}", &sub.digest[..12.min(sub.digest.len())], sub.host_path, sub.speculative_host_path);

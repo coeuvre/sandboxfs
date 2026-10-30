@@ -14,5 +14,8 @@ backend = { path = "../backend" }
 backend-cfs = { path = "../backend-cfs" }
 backend-fskit = { path = "../backend-fskit" }
 backend-hardlink = { path = "../backend-hardlink" }
-metrics = { path = "../metrics" }
 libc = "0.2"
+rustc-hash = "2.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metrics = { path = "../metrics" }

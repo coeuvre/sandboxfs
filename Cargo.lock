@@ -69,4 +69,5 @@ dependencies = [
  "backend-hardlink",
  "libc",
  "metrics",
+ "rustc-hash",
 ]

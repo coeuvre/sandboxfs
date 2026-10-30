@@ -2,7 +2,7 @@
 // input tree by digest but does not carry it -- see `tree::resolve`. Fields decode on first access:
 // scalars are slices of the frame, maps are built once and kept.
 
-use crate::wire::{parse_map_entry, string, Reader};
+use crate::wire::{parse_map_entry, string, Reader, Writer};
 use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
@@ -24,6 +24,48 @@ pub struct Manifest<'a> {
 impl<'a> Manifest<'a> {
     pub fn new(bytes: &'a [u8]) -> Manifest<'a> {
         Manifest { bytes, outputs: OnceCell::new(), writable_dirs: OnceCell::new() }
+    }
+
+    /// Encode a `Manifest` frame from REAPI v2 `Action` / `Command` / `Platform` fields so a
+    /// REAPI v2 `Execution.Execute` call drives the exact same `Backend::create` / `collect` /
+    /// `destroy` interface.
+    pub fn encode(
+        mnemonic: &str,
+        exec_root: &str,
+        input_root_digest: &str,
+        outputs: &[(String, String, String)],
+        writable_dirs: &[String],
+    ) -> Vec<u8> {
+        let mut w = Writer::default();
+        if !mnemonic.is_empty() {
+            w.str(1, mnemonic);
+        }
+        if !exec_root.is_empty() {
+            w.str(2, exec_root);
+        }
+        if !input_root_digest.is_empty() {
+            let mut dg = Writer::default();
+            dg.str(1, input_root_digest);
+            w.msg(4, &dg.out);
+        }
+        for (path, kind, dest) in outputs {
+            let mut out_val = Writer::default();
+            out_val.str(1, kind);
+            if !dest.is_empty() {
+                out_val.str(2, dest);
+            }
+            let mut entry = Writer::default();
+            entry.str(1, path);
+            entry.msg(2, &out_val.out);
+            w.msg(5, &entry.out);
+        }
+        for dir in writable_dirs {
+            let mut entry = Writer::default();
+            entry.str(1, dir);
+            entry.msg(2, b"");
+            w.msg(6, &entry.out);
+        }
+        w.out
     }
 
     /// The action mnemonic (field 1).
